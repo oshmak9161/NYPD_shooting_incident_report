@@ -1,0 +1,273 @@
+---
+title: "NYPD Report Final"
+author: "M.O."
+date: "`r Sys.Date()`"
+output: pdf_document
+---
+
+
+
+
+
+# Data Import 
+1. Packages used;
+```{r setup, message=FALSE}
+if (!require("hms")) install.packages("hms")
+library(tidyverse)
+library(lubridate)
+library(hms)
+```
+
+
+2. Import data from NYC Incident Report website, read the csv into `raw_data` variable.
+```{r data_import}
+url_in <- "https://data.cityofnewyork.us/api/views/833y-fsy8/rows.csv?accessType=DOWNLOAD"
+
+raw_data <- read.csv(url_in) %>%
+  mutate(date = mdy(OCCUR_DATE),
+         year = year(date),
+         time = parse_time(OCCUR_TIME),
+         boro = BORO,
+         precinct = PRECINCT,
+         murder_flag = STATISTICAL_MURDER_FLAG) %>%
+  select(year, time, boro, precinct, murder_flag)
+
+summary(raw_data)
+
+```
+
+
+# EDA
+
+1. Group by precinct, year, murder_flag and count up shooting incidents.
+
+```{r data_prep, echo=TRUE}
+trend_df <- raw_data %>% 
+  group_by(precinct, year, murder_flag) %>%
+  count() %>%
+  ungroup() 
+  
+trend_df
+```
+
+2. Pivot wider to separate murder and non-murder cases
+```{r EDA}
+
+trend_df2 <- trend_df %>% 
+  pivot_wider(names_from = murder_flag, values_from = n) %>%
+  rename(cases = false,
+         deaths = true) %>%
+  replace_na(list(cases = 0, deaths = 0))
+
+trend_df2
+```
+
+3. Import precinct population data
+```{r precinct_pop}
+#Importing 2020 census data
+pop_url <- "https://raw.githubusercontent.com/jkeefe/census-by-precincts/master/data/nyc/nyc_block_precinct_2020pop.csv"
+pop_csv <- read.csv(pop_url) %>% 
+  select(precinct, P1_001N) %>% 
+  group_by(precinct) %>%
+  mutate(pop_2020 = sum(P1_001N)) %>%
+  select(precinct, pop_2020) %>%
+  unique() %>%
+  filter(!pop_2020==0)
+
+
+#Importing 2010 census data
+url_2010 <- "https://s3.amazonaws.com/media.johnkeefe.net/nypd-data/nyc_2010pop_2020precincts.csv"
+
+pop2010_csv <- read.csv(url_2010) %>%
+  select(precinct_2020, P0010001) %>%
+  rename(precinct = precinct_2020,
+         pop_2010 = P0010001) %>%
+  unique()
+
+```
+
+
+4. Interpolate population for other years based on the difference between the 2020 and 2010 census data. 
+
+```{r interpolation, warning=FALSE}
+precinct_pop <- pop_csv %>%
+  left_join(pop2010_csv, by="precinct") %>%
+  mutate(`2023` = pop_2020 - 3 * (pop_2020 * 0.024),
+         `2022` = pop_2020 - 2 * (pop_2020 * 0.024),
+         `2021` = pop_2020 - (pop_2020 * 0.024),
+         `2020` = pop_2020,
+         `2019` = pop_2020 - (pop_2020 - pop_2010)/10,
+         `2018` = pop_2020 - 2 * (pop_2020 - pop_2010)/10,
+         `2017` = pop_2020 - 3 * (pop_2020 - pop_2010)/10,
+         `2016` = pop_2020 - 4 * (pop_2020 - pop_2010)/10,
+         `2015` = pop_2020 - 5 * (pop_2020 - pop_2010)/10,
+         `2014` = pop_2020 - 6 * (pop_2020 - pop_2010)/10,
+         `2013` = pop_2020 - 7 * (pop_2020 - pop_2010)/10,
+         `2012` = pop_2020 - 8 * (pop_2020 - pop_2010)/10,
+         `2011` = pop_2020 - 9 * (pop_2020 - pop_2010)/10,
+         `2010` = pop_2010,
+         `2009` = pop_2010 - (pop_2010 * 0.031),
+         `2008` = pop_2010 - 2 * (pop_2010 * 0.0031),
+         `2007` = pop_2010 - 3 * (pop_2010 * 0.0031),
+         `2006` = pop_2010 - 4 * (pop_2010 * 0.0031)) %>%
+  select(-c(pop_2020, pop_2010)) %>%
+  pivot_longer(!precinct, names_to = "year", values_to = "pop") %>%
+  mutate(year = as.double(year))
+
+precinct_pop$pop <- round(precinct_pop$pop, digits = 0)
+head(precinct_pop)
+
+```
+
+ 
+5. Left join the `trend_df2` and `precinct_pop` to calculate injuries and deaths rates of each precinct. 
+
+```{r left_join_pop, warning=FALSE}
+trend_df_w_pop <- trend_df2 %>% 
+  left_join(precinct_pop, by=c("precinct" = "precinct", "year"="year")) %>%
+  mutate(case_rate = cases / pop * 100000,
+         death_rate = deaths / pop * 100000,
+         precinct = as.factor(precinct))
+trend_df_w_pop
+
+```
+
+
+6. Find Max murder rate and non-murder rate
+```{r slice_max, message=FALSE}
+mean_df <- trend_df_w_pop %>% 
+  select(precinct, death_rate, case_rate) %>%
+  group_by(precinct) %>%
+  mutate(mean_death = mean(death_rate),
+         mean_case = mean(case_rate)) %>%
+  ungroup() %>%
+  select(precinct, mean_death, mean_case) %>%
+  unique()
+  
+```
+
+7. Precincts with the highest murder rate
+```{r max_precinct, message=FALSE}
+mean_df %>% slice_max(mean_death, n=10)
+
+```
+The precincts that has the highest rate of deaths on average are 73, 81, 79, 42, 48, 41, 77, 25, 40, 75. There's an outlier in precinct 22. 
+
+8. Handling an outlier in precinct 22.
+
+```{r handling_outlier, message=FALSE}
+
+mean_df$mean_case[mean_df$precinct == 22] <- 0
+boxplot(mean_df$mean_case)
+```
+
+# Visualization 1
+1. Visualize the number of incidents in 2023 by precinct and year
+
+```{r top10_precinct_in_2023, warning=FALSE}
+# Extract 2023 data
+total2023 <- trend_df_w_pop %>% 
+  filter(year == 2023, death_rate > 0)
+
+# Reordering the data by n in a decreasing order
+total2023 <- total2023[order(total2023$death_rate, decreasing = TRUE),]
+
+total2023$precinct <- factor(total2023$precinct, 
+                             levels = total2023$precinct[order(total2023$death_rate)])
+
+  
+ggplot(data=total2023, aes(x=death_rate, y=precinct, group=precinct))+
+  geom_col(aes(fill=precinct)) + 
+    labs(title="2023 Death Rate by Precinct", 
+       x="Death Rate", y="Precinct")
+```
+
+
+The top 10 precincts with the highest murder rate in 2023 are 48, 25, 41, 46, 42, 33, 32, 75, 67, 47.  
+
+# Visualization 2
+1. Visualize the trend of 2023 top offenders
+
+```{r visualize_top_offenders}
+
+top_offenders_2023 <- trend_df_w_pop %>%
+  filter(precinct %in% c("48", "25", "41", "46", "42", "33", "32", "75", "67", "47")) 
+
+
+ggplot(data=top_offenders_2023, aes(x=year, y=death_rate))+
+  geom_line(aes(colour = precinct))+
+  labs(title="Trend of 2023 Top Offenders", x="Year", y="Death Rate")
+
+```
+While many precincts show downward trend in murder rate, there's a couple of precincts with increasing trend. 
+
+2. Find the precincts with increasing trend.
+
+```{r change_rate}
+two_year_df <- trend_df_w_pop %>% 
+  filter(year %in% c(2022, 2023)) %>%
+  select(precinct, death_rate, year) %>%
+  pivot_wider(names_from = year, values_from = death_rate) %>%
+  mutate(changes = `2023`-`2022`)
+
+two_year_df %>% 
+  filter(precinct %in% c("48", "25", "41", "46", "42", "33", "32", "75", "67", "47")) %>% 
+  filter(changes > 3)
+
+```
+
+
+
+
+# Modeling the Data
+1. Data preparation for model
+```{r data_prep_for_model, warning=FALSE}
+precinct_totals <- trend_df_w_pop %>% group_by(precinct) %>% 
+  summarize(deaths = max(deaths), 
+            cases = max(cases), 
+            population=max(pop), 
+            cases_per_100k = 100000 * cases/population, 
+            deaths_per_100k = 100000* deaths/population) 
+
+#Handling outlier
+precinct_totals$cases_per_100k[precinct_totals$precinct == 22] <- 0
+
+precinct_totals
+```
+
+2. Create a linear model
+
+```{r model_creation, message=FALSE}
+mod <- lm(deaths_per_100k ~ cases_per_100k, data=precinct_totals)
+
+summary(mod)
+```
+
+3. Add prediction to the data and visualize it. 
+
+```{r prediction, message=FALSE}
+tot_w_pred <- precinct_totals %>% 
+  ungroup() %>% 
+  mutate(pred = predict(mod))%>%
+  select(cases_per_100k, deaths_per_100k, pred, everything())
+
+tot_w_pred
+
+tot_w_pred %>% 
+  ggplot() + 
+  geom_point(aes(x=cases_per_100k, y=deaths_per_100k), color="blue") + 
+  geom_point(aes(x=cases_per_100k, y=pred), color="red")+
+  labs(title = "Linear Model Prediction", x="Cases per 100k", y="Death per 100k")
+```
+
+# Summary
+
+This analysis explored the relationship between murder and non-murder rate of shooting incidents using a linear model. The model suggests a strong linear correlation between the variables with the adjusted R-squared value of 0.9125. 
+
+While the analysis provide important insights into high-crime precincts, there are two biases involved in my data analysis. 
+
+First, there is a potential for data transformation bias. It's important to note that the yearly population of each precinct was estimated using interpolation based on two census data points in 2010 and 2020. Additionally, NYC's population declined from 8.8 million to 8.26 million between 2020 and 2023. This change rate was used across the board to estimate precinct populations for 2021 and later years. Furthermore, an annual change of 0.31%, obtained from an online source, was used to estimate precinct populations for 2006 to 2009. Therefore, the actual population figures may be different, potentially affecting the accuracy of the calculated case rate and death rates.
+
+Second, there is a potential for outlier handling bias. Precinct 22, which covers Central Park, exhibits an outlier in its calculated case rate. This is because the precinct's population was only 129 in 2020. When one injury case was reported, dividing it by 129 and multiplying it by 100,000 resulted in an case rate of 775! This significantly deviates from the case rates of other precincts. A single case does not substantially impact the ultimate goal of reducing murder rates, I chose to address this outlier by setting its value to zero.
+
+As a next step, I recommend analyzing crime patterns within these precincts, including time of day, day of week, and location-specific data to identify hotspots. Additionally, benchmarking high-crime precincts against lower-crime precincts would be beneficial for identifying potential best practices.
